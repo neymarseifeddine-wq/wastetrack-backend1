@@ -41,44 +41,38 @@ CORS(app,
 # Falls back to port 465 (SSL) if 587 (STARTTLS) fails.
 MAIL_USERNAME = os.environ.get('MAIL_USERNAME', '')
 MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD', '')
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
-def send_email(to_address: str, subject: str, body: str) -> tuple[bool, str]:
+def send_email(to_address: str, subject: str, body: str) -> tuple:
     """
-    Send an email via Gmail. Tries STARTTLS (port 587) first,
-    then SSL (port 465) as fallback. Returns (success, error_message).
+    Send email via Brevo (Sendinblue) HTTP API — works on Railway (port 443 only).
+    Free tier: 300 emails/day. Set BREVO_API_KEY in Railway environment variables.
+    Sign up free at https://app.brevo.com
     """
-    import smtplib, ssl
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+    if not BREVO_API_KEY:
+        print("[EMAIL] BREVO_API_KEY not set — cannot send email")
+        return False, "BREVO_API_KEY environment variable not set"
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"WasteTrack <{MAIL_USERNAME}>"
-    msg["To"]      = to_address
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    # Try STARTTLS on port 587
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
-            server.ehlo()
-            server.starttls(context=ssl.create_default_context())
-            server.ehlo()
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
-        return True, ""
-    except Exception as e1:
-        print(f"[EMAIL] STARTTLS port 587 failed: {e1}")
-
-    # Fallback: SSL on port 465
-    try:
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=15) as server:
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
-        return True, ""
-    except Exception as e2:
-        print(f"[EMAIL] SSL port 465 also failed: {e2}")
-        return False, f"587: {e1} | 465: {e2}"
+        resp = http_requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json={
+                "sender":      {"name": "WasteTrack", "email": MAIL_USERNAME or "noreply@wastetrack.app"},
+                "to":          [{"email": to_address}],
+                "subject":     subject,
+                "textContent": body
+            },
+            headers={
+                "api-key":      BREVO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            timeout=15
+        )
+        if resp.status_code in (200, 201, 202):
+            return True, ""
+        return False, f"Brevo API error: {resp.status_code} {resp.text}"
+    except Exception as e:
+        return False, str(e)
 
 # Temporary store for verification codes {email: (code, expiry_timestamp)}
 # WARNING: These are in-memory only — they are lost on server restart.
