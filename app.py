@@ -29,9 +29,12 @@ from flask_jwt_extended import (
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False,
-     allow_headers=["Content-Type", "Authorization"],
-     methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"])
+CORS(app,
+     resources={r"/api/*": {"origins": "*"}},
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+     expose_headers=["Authorization"])
 
 # ── Email config ──────────────────────────────
 # Uses smtplib directly (no Flask-Mail) to avoid IPv6 issues.
