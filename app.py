@@ -409,13 +409,17 @@ def google_callback():
 # MARKERS ROUTES
 # ─────────────────────────────────────────
 @app.route("/api/markers", methods=["GET"])
-@jwt_required()
 def get_markers():
+    # Public endpoint — no login required to view waste container locations
     type_filter = request.args.get("type")
     if type_filter and type_filter != "all":
         rows = query("SELECT * FROM markers WHERE type=%s ORDER BY created_at DESC", (type_filter,))
     else:
         rows = query("SELECT * FROM markers ORDER BY created_at DESC")
+    # Convert Decimal lat/lng to float for JSON serialization
+    for row in (rows or []):
+        if row.get("lat") is not None:  row["lat"] = float(row["lat"])
+        if row.get("lng") is not None:  row["lng"] = float(row["lng"])
     return jsonify(rows)
 
 
