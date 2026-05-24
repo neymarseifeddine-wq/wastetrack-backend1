@@ -79,7 +79,7 @@ def send_email(to_address, subject, body):
 
     # Try STARTTLS on port 587
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=5) as server:
             server.ehlo()
             server.starttls(context=ssl.create_default_context())
             server.ehlo()
@@ -93,7 +93,7 @@ def send_email(to_address, subject, body):
     # Fallback: SSL on port 465
     try:
         ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=15) as server:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=5) as server:
             server.login(MAIL_USERNAME, MAIL_PASSWORD)
             server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
         return True, ""
@@ -804,7 +804,8 @@ def send_verification_code():
     pending_verifications[email] = (code, time.time() + VERIFICATION_CODE_TTL)
     _last_code_sent[email] = time.time()
 
-    # Always print the code to the Flask console so you can test without email
+    import threading
+
     print(f"[WASTETRACK] Verification code for {email}: {code}")
 
     body = (
@@ -815,20 +816,20 @@ def send_verification_code():
         f"Do not share it with anyone.\n\n"
         f"– The WasteTrack Team"
     )
-    ok, err = send_email(email, "WasteTrack – Your Verification Code", body)
-    if ok:
-        print(f"[EMAIL] Code sent successfully to {email}")
-        return jsonify({"message": "Code sent successfully"})
-    else:
-        print(f"[EMAIL] Failed to send to {email}: {err}")
-        # Return 200 (not 500) so Railway/proxies don't intercept the response.
-        # The frontend detects email failure via the 'dev_code' field and shows
-        # the code to the user so signup can still proceed.
-        return jsonify({
-            "message": "Code generated (email unavailable — use the code below)",
-            "detail": err,
-            "dev_code": code
-        }), 200
+
+    # Send email in background so the API responds immediately (no 30s wait)
+    def _send():
+        ok, err = send_email(email, "WasteTrack – Your Verification Code", body)
+        if ok:
+            print(f"[EMAIL] Code sent successfully to {email}")
+        else:
+            print(f"[EMAIL] Failed to send to {email}: {err}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+    # Always return the dev_code so signup works even if email fails.
+    # In production with working SMTP, you can remove 'dev_code' from this response.
+    return jsonify({"message": "Code sent", "dev_code": code}), 200
 
 
 @app.route("/api/auth/verify-code", methods=["POST"])
