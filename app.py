@@ -31,75 +31,48 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 CORS(app,
      resources={r"/api/*": {"origins": "*"}},
-     supports_credentials=False,
+     supports_credentials=True,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
      methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
      expose_headers=["Authorization"])
-
-# Explicit OPTIONS handler — ensures preflight requests always get 200
-# even on routes that don't declare OPTIONS themselves.
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        from flask import make_response
-        res = make_response()
-        res.headers["Access-Control-Allow-Origin"]  = "*"
-        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        return res, 200
 
 # ── Email config ──────────────────────────────
 # Uses smtplib directly (no Flask-Mail) to avoid IPv6 issues.
 # Falls back to port 465 (SSL) if 587 (STARTTLS) fails.
 MAIL_USERNAME = os.environ.get('MAIL_USERNAME', '')
 MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD', '')
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
 
-def send_email(to_address, subject, body):
-    # type: (str, str, str) -> tuple
+def send_email(to_address: str, subject: str, body: str) -> tuple:
     """
-    Send an email via Gmail. Tries STARTTLS (port 587) first,
-    then SSL (port 465) as fallback. Returns (success, error_message).
-    Compatible with Python 3.7+.
+    Send email via Brevo (Sendinblue) HTTP API — works on Railway (port 443 only).
+    Free tier: 300 emails/day. Set BREVO_API_KEY in Railway environment variables.
+    Sign up free at https://app.brevo.com
     """
-    import smtplib, ssl
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
+    if not BREVO_API_KEY:
+        print("[EMAIL] BREVO_API_KEY not set — cannot send email")
+        return False, "BREVO_API_KEY environment variable not set"
 
-    # Guard: if credentials are missing, fail immediately instead of crashing
-    if not MAIL_USERNAME or not MAIL_PASSWORD:
-        return False, "MAIL_USERNAME or MAIL_PASSWORD not set in environment variables"
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = f"WasteTrack <{MAIL_USERNAME}>"
-    msg["To"]      = to_address
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    e1_msg = ""  # ensure e1 is always defined before the second try block
-
-    # Try STARTTLS on port 587
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=5) as server:
-            server.ehlo()
-            server.starttls(context=ssl.create_default_context())
-            server.ehlo()
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
-        return True, ""
-    except Exception as e1:
-        e1_msg = str(e1)
-        print(f"[EMAIL] STARTTLS port 587 failed: {e1}")
-
-    # Fallback: SSL on port 465
-    try:
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=5) as server:
-            server.login(MAIL_USERNAME, MAIL_PASSWORD)
-            server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
-        return True, ""
-    except Exception as e2:
-        print(f"[EMAIL] SSL port 465 also failed: {e2}")
-        return False, f"587: {e1_msg} | 465: {e2}"
+        resp = http_requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            json={
+                "sender":      {"name": "WasteTrack", "email": MAIL_USERNAME or "noreply@wastetrack.app"},
+                "to":          [{"email": to_address}],
+                "subject":     subject,
+                "textContent": body
+            },
+            headers={
+                "api-key":      BREVO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            timeout=15
+        )
+        if resp.status_code in (200, 201, 202):
+            return True, ""
+        return False, f"Brevo API error: {resp.status_code} {resp.text}"
+    except Exception as e:
+        return False, str(e)
 
 # Temporary store for verification codes {email: (code, expiry_timestamp)}
 # WARNING: These are in-memory only — they are lost on server restart.
@@ -244,7 +217,7 @@ def register():
         return jsonify({"error": "Invalid email format"}), 400
     if email not in verified_emails:
         return jsonify({"error": "Email not verified. Please verify your email first"}), 403
-    verified_emails.discard(email)  # remove after use
+    verified_emails.discard(email)
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
@@ -255,22 +228,45 @@ def register():
     user_id         = str(uuid.uuid4())
     municipality    = None
     municipality_id = None
+    phone           = None
+    position        = None
     status          = "active"
 
     if role == "admin":
         municipality    = (data.get("municipality") or "").strip()
         municipality_id = (data.get("municipalityId") or "").strip()
+        phone           = (data.get("phone") or "").strip() or None
+        position        = (data.get("position") or "").strip() or None
+        name            = (data.get("adminName") or name).strip()
         if not municipality or not municipality_id:
             return jsonify({"error": "municipality and municipalityId required for admin"}), 400
-        name   = (data.get("adminName") or name).strip()
         status = "pending"
 
     execute(
         """INSERT INTO users
-           (id, name, email, password, role, municipality, municipality_id, status, provider, created_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (user_id, name, email, hashed, role, municipality, municipality_id, status, "email", now_dt())
+           (id, name, email, password, role, municipality, municipality_id, phone, position, status, provider, created_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (user_id, name, email, hashed, role, municipality, municipality_id, phone, position, status, "email", now_dt())
     )
+
+    # Create municipality record when admin registers
+    if role == "admin":
+        wilaya = (data.get("wilaya") or "").strip() or None
+        existing = query("SELECT id FROM municipalities WHERE id=%s", (municipality_id,), one=True)
+        if not existing:
+            execute(
+                """INSERT INTO municipalities
+                   (id, name, wilaya, admin_id, admin_name, admin_email, admin_phone, admin_position, status, registered_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (municipality_id, municipality, wilaya, user_id, name, email, phone, position, "pending", now_dt())
+            )
+        else:
+            # Update existing municipality with new admin info
+            execute(
+                """UPDATE municipalities SET admin_id=%s, admin_name=%s, admin_email=%s,
+                   admin_phone=%s, admin_position=%s, status='pending' WHERE id=%s""",
+                (user_id, name, email, phone, position, municipality_id)
+            )
 
     access  = create_access_token(identity=user_id)
     refresh = create_refresh_token(identity=user_id)
@@ -436,13 +432,17 @@ def google_callback():
 # MARKERS ROUTES
 # ─────────────────────────────────────────
 @app.route("/api/markers", methods=["GET"])
-@jwt_required()
 def get_markers():
+    # Public endpoint — no login required to view waste container locations
     type_filter = request.args.get("type")
     if type_filter and type_filter != "all":
         rows = query("SELECT * FROM markers WHERE type=%s ORDER BY created_at DESC", (type_filter,))
     else:
         rows = query("SELECT * FROM markers ORDER BY created_at DESC")
+    # Convert Decimal lat/lng to float for JSON serialization
+    for row in (rows or []):
+        if row.get("lat") is not None:  row["lat"] = float(row["lat"])
+        if row.get("lng") is not None:  row["lng"] = float(row["lng"])
     return jsonify(rows)
 
 
@@ -581,40 +581,6 @@ def submit_complaint():
     )
 
     row = query("SELECT * FROM complaints WHERE id=%s", (complaint_id,), one=True)
-
-    # Fix 2: Send confirmation email to citizen
-    citizen_body = (
-        f"Hello {reporter_name},\n\n"
-        f"Your complaint has been successfully submitted to WasteTrack.\n\n"
-        f"  Reference Number : {ref_number}\n"
-        f"  Issue Type       : {issue_type}\n"
-        f"  Severity         : {severity}\n"
-        f"  Location         : {location}\n"
-        f"  Submitted at     : {created_at}\n\n"
-        f"You can use the reference number above to track the status of your complaint.\n"
-        f"{'We will follow up with you by email once the issue is addressed.' if want_follow_up else ''}\n\n"
-        f"Thank you for helping keep your community clean!\n\n"
-        f"– The WasteTrack Team"
-    )
-    send_email(reporter_email, f"WasteTrack – Complaint Received ({ref_number})", citizen_body)
-
-    # Fix 1: Notify all active admins of the new complaint
-    admin_emails = query("SELECT email, name FROM users WHERE role='admin' AND status='active'")
-    admin_subject = f"[WasteTrack] New Complaint: {ref_number}"
-    admin_body = (
-        f"A new complaint has been submitted.\n\n"
-        f"  Reference : {ref_number}\n"
-        f"  Reporter  : {reporter_name} ({reporter_email})\n"
-        f"  Issue     : {issue_type}\n"
-        f"  Severity  : {severity}\n"
-        f"  Location  : {location}\n"
-        f"  Details   : {description[:200]}{'...' if len(description) > 200 else ''}\n\n"
-        f"Please log in to the WasteTrack admin panel to review and act on this complaint.\n\n"
-        f"– WasteTrack Automated Alert"
-    )
-    for admin in admin_emails:
-        send_email(admin["email"], admin_subject, admin_body)
-
     return jsonify(row), 201
 
 
@@ -630,7 +596,10 @@ def list_complaints():
         sql    = "SELECT * FROM complaints WHERE 1=1"
         params = []
         if status_filter:
-            sql += " AND status=%s";     params.append(status_filter)
+            sql += " AND status=%s"; params.append(status_filter)
+        else:
+            # By default exclude resolved and closed — admins only see active reports
+            sql += " AND status NOT IN ('resolved','closed')"
         if type_filter:
             sql += " AND issue_type=%s"; params.append(type_filter)
         sql += " ORDER BY created_at DESC"
@@ -667,8 +636,7 @@ def update_complaint_status(complaint_id):
     if status not in VALID:
         return jsonify({"error": f"status must be one of {VALID}"}), 400
 
-    existing = query("SELECT * FROM complaints WHERE id=%s", (complaint_id,), one=True)
-    if not existing:
+    if not query("SELECT id FROM complaints WHERE id=%s", (complaint_id,), one=True):
         return jsonify({"error": "Complaint not found"}), 404
 
     execute("UPDATE complaints SET status=%s, updated_at=%s WHERE id=%s",
@@ -678,21 +646,6 @@ def update_complaint_status(complaint_id):
     return jsonify(row)
 
 
-# Fix 3: Admin – resolved/closed complaints history
-@app.route("/api/complaints/history", methods=["GET"])
-@admin_required
-def complaints_history():
-    """Return all resolved and closed complaints, newest first."""
-    type_filter = request.args.get("type")
-    sql    = "SELECT * FROM complaints WHERE status IN ('resolved','closed')"
-    params = []
-    if type_filter:
-        sql += " AND issue_type=%s"; params.append(type_filter)
-    sql += " ORDER BY updated_at DESC"
-    rows = query(sql, params)
-    return jsonify(rows)
-
-
 # ─────────────────────────────────────────
 # ADMIN – USER MANAGEMENT
 # ─────────────────────────────────────────
@@ -700,7 +653,7 @@ def complaints_history():
 @admin_required
 def list_users():
     rows = query(
-        "SELECT id,name,email,role,municipality,status,created_at,last_login FROM users ORDER BY created_at DESC"
+        "SELECT id,name,email,role,municipality,municipality_id,phone,position,status,created_at,last_login FROM users ORDER BY created_at DESC"
     )
     return jsonify(rows)
 
@@ -714,27 +667,43 @@ def update_user_status(user_id):
     if status not in VALID:
         return jsonify({"error": f"status must be one of {VALID}"}), 400
 
-    if not query("SELECT id FROM users WHERE id=%s", (user_id,), one=True):
+    user = query("SELECT id,role,municipality_id FROM users WHERE id=%s", (user_id,), one=True)
+    if not user:
         return jsonify({"error": "User not found"}), 404
-
-    # Fetch current status before updating (needed for approval notification)
-    target_user = query("SELECT name, email, status, role FROM users WHERE id=%s", (user_id,), one=True)
 
     execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
 
-    # Fix 5: Notify admin when their account is approved
-    if status == "active" and target_user["status"] == "pending" and target_user["role"] == "admin":
-        approval_body = (
-            f"Hello {target_user['name']},\n\n"
-            f"Great news! Your WasteTrack admin account has been reviewed and approved.\n\n"
-            f"Your account is now active. You can log in to the WasteTrack admin panel "
-            f"to start managing complaints and monitoring your municipality.\n\n"
-            f"If you have any questions, please contact the WasteTrack support team.\n\n"
-            f"– The WasteTrack Team"
-        )
-        send_email(target_user["email"], "WasteTrack – Your Admin Account is Now Active", approval_body)
+    # Sync municipality status when approving/suspending an admin
+    if user["role"] == "admin" and user.get("municipality_id"):
+        muni_status = status  # active, pending, or suspended
+        if status == "active":
+            execute(
+                "UPDATE municipalities SET status='active', approved_at=%s WHERE id=%s",
+                (now_dt(), user["municipality_id"])
+            )
+        else:
+            execute(
+                "UPDATE municipalities SET status=%s WHERE id=%s",
+                (muni_status, user["municipality_id"])
+            )
 
     return jsonify({"message": f"User status updated to {status}"})
+
+
+@app.route("/api/admin/municipalities", methods=["GET"])
+@admin_required
+def list_municipalities():
+    rows = query("SELECT * FROM municipalities ORDER BY registered_at DESC")
+    return jsonify(rows or [])
+
+
+@app.route("/api/admin/municipalities/<muni_id>", methods=["GET"])
+@admin_required
+def get_municipality(muni_id):
+    row = query("SELECT * FROM municipalities WHERE id=%s", (muni_id,), one=True)
+    if not row:
+        return jsonify({"error": "Municipality not found"}), 404
+    return jsonify(row)
 
 
 # ─────────────────────────────────────────
@@ -804,8 +773,7 @@ def send_verification_code():
     pending_verifications[email] = (code, time.time() + VERIFICATION_CODE_TTL)
     _last_code_sent[email] = time.time()
 
-    import threading
-
+    # Always print the code to the Flask console so you can test without email
     print(f"[WASTETRACK] Verification code for {email}: {code}")
 
     body = (
@@ -816,20 +784,19 @@ def send_verification_code():
         f"Do not share it with anyone.\n\n"
         f"– The WasteTrack Team"
     )
-
-    # Send email in background so the API responds immediately (no 30s wait)
-    def _send():
-        ok, err = send_email(email, "WasteTrack – Your Verification Code", body)
-        if ok:
-            print(f"[EMAIL] Code sent successfully to {email}")
-        else:
-            print(f"[EMAIL] Failed to send to {email}: {err}")
-
-    threading.Thread(target=_send, daemon=True).start()
-
-    # Always return the dev_code so signup works even if email fails.
-    # In production with working SMTP, you can remove 'dev_code' from this response.
-    return jsonify({"message": "Code sent", "dev_code": code}), 200
+    ok, err = send_email(email, "WasteTrack – Your Verification Code", body)
+    if ok:
+        print(f"[EMAIL] Code sent successfully to {email}")
+        return jsonify({"message": "Code sent successfully"})
+    else:
+        traceback.print_exc()
+        # dev_code lets the frontend still work even when SMTP is blocked.
+        # REMOVE 'dev_code' before deploying to production.
+        return jsonify({
+            "error": "Failed to send email – check Flask console for the code",
+            "detail": err,
+            "dev_code": code
+        }), 500
 
 
 @app.route("/api/auth/verify-code", methods=["POST"])
@@ -855,76 +822,6 @@ def verify_code():
     del pending_verifications[email]
     verified_emails.add(email)
     return jsonify({"message": "Email verified", "verified": True})
-
-
-# ─────────────────────────────────────────
-# Fix 6: PASSWORD RESET (Forgot Password)
-# ─────────────────────────────────────────
-# In-memory store: {token: (user_id, expiry_timestamp)}
-# For production, replace with a DB table (e.g. password_reset_tokens).
-_reset_tokens = {}
-RESET_TOKEN_TTL = 900  # 15 minutes
-
-
-@app.route("/api/auth/forgot-password", methods=["POST"])
-def forgot_password():
-    data  = request.get_json(force=True, silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-
-    if not email or not validate_email(email):
-        return jsonify({"error": "Valid email required"}), 400
-
-    # Always return the same message to prevent email enumeration
-    generic_ok = {"message": "If that email is registered, a reset link has been sent."}
-
-    user = query("SELECT id, name, password FROM users WHERE email=%s", (email,), one=True)
-    if not user or not user["password"]:
-        # Not found, or Google OAuth user (no password to reset)
-        return jsonify(generic_ok)
-
-    token  = str(uuid.uuid4())
-    expiry = time.time() + RESET_TOKEN_TTL
-    _reset_tokens[token] = (user["id"], expiry)
-
-    reset_link = f"{FRONTEND_URL}?reset_token={token}"
-    body = (
-        f"Hello {user['name']},\n\n"
-        f"We received a request to reset your WasteTrack password.\n\n"
-        f"Click the link below to set a new password (valid for 15 minutes):\n\n"
-        f"  {reset_link}\n\n"
-        f"If you did not request this, you can safely ignore this email — "
-        f"your password will not be changed.\n\n"
-        f"– The WasteTrack Team"
-    )
-    send_email(email, "WasteTrack – Password Reset Request", body)
-    return jsonify(generic_ok)
-
-
-@app.route("/api/auth/reset-password", methods=["POST"])
-def reset_password():
-    data         = request.get_json(force=True, silent=True) or {}
-    token        = (data.get("token") or "").strip()
-    new_password = data.get("password", "")
-
-    if not token or not new_password:
-        return jsonify({"error": "token and password required"}), 400
-    if len(new_password) < 6:
-        return jsonify({"error": "Password must be at least 6 characters"}), 400
-
-    stored = _reset_tokens.get(token)
-    if not stored:
-        return jsonify({"error": "Invalid or expired reset token"}), 400
-
-    user_id, expiry = stored
-    if time.time() > expiry:
-        del _reset_tokens[token]
-        return jsonify({"error": "Reset token has expired. Please request a new one."}), 400
-
-    hashed = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    execute("UPDATE users SET password=%s WHERE id=%s", (hashed, user_id))
-    del _reset_tokens[token]  # one-time use only
-
-    return jsonify({"message": "Password updated successfully. You can now log in."})
 
 
 @app.route("/api/auth/test-email", methods=["POST"])
@@ -959,12 +856,37 @@ def init_db():
                 role            ENUM('citizen','admin') NOT NULL DEFAULT 'citizen',
                 municipality    VARCHAR(120) DEFAULT NULL,
                 municipality_id VARCHAR(60)  DEFAULT NULL,
+                phone           VARCHAR(30)  DEFAULT NULL,
+                position        VARCHAR(120) DEFAULT NULL,
                 status          ENUM('active','pending','suspended') NOT NULL DEFAULT 'active',
                 provider        ENUM('email','google') NOT NULL DEFAULT 'email',
                 last_login      DATETIME     DEFAULT NULL,
                 created_at      DATETIME     NOT NULL,
                 PRIMARY KEY (id),
                 UNIQUE KEY email (email)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        # Add phone/position columns if upgrading from old schema
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN phone VARCHAR(30) DEFAULT NULL")
+        except: pass
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN position VARCHAR(120) DEFAULT NULL")
+        except: pass
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS municipalities (
+                id              VARCHAR(60)  NOT NULL,
+                name            VARCHAR(120) NOT NULL,
+                wilaya          VARCHAR(120) DEFAULT NULL,
+                admin_id        VARCHAR(36)  DEFAULT NULL,
+                admin_name      VARCHAR(120) DEFAULT NULL,
+                admin_email     VARCHAR(120) DEFAULT NULL,
+                admin_phone     VARCHAR(30)  DEFAULT NULL,
+                admin_position  VARCHAR(120) DEFAULT NULL,
+                status          ENUM('active','pending','suspended') NOT NULL DEFAULT 'pending',
+                registered_at   DATETIME     NOT NULL,
+                approved_at     DATETIME     DEFAULT NULL,
+                PRIMARY KEY (id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         cur.execute("""
