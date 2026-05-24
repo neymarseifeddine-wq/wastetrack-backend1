@@ -31,10 +31,22 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 CORS(app,
      resources={r"/api/*": {"origins": "*"}},
-     supports_credentials=True,
+     supports_credentials=False,
      allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
      methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
      expose_headers=["Authorization"])
+
+# Explicit OPTIONS handler — ensures preflight requests always get 200
+# even on routes that don't declare OPTIONS themselves.
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        from flask import make_response
+        res = make_response()
+        res.headers["Access-Control-Allow-Origin"]  = "*"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        return res, 200
 
 # ── Email config ──────────────────────────────
 # Uses smtplib directly (no Flask-Mail) to avoid IPv6 issues.
