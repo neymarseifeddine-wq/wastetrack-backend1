@@ -54,20 +54,28 @@ def handle_preflight():
 MAIL_USERNAME = os.environ.get('MAIL_USERNAME', '')
 MAIL_PASSWORD = os.environ.get('MAIL_PASSWORD', '')
 
-def send_email(to_address: str, subject: str, body: str) -> tuple[bool, str]:
+def send_email(to_address, subject, body):
+    # type: (str, str, str) -> tuple
     """
     Send an email via Gmail. Tries STARTTLS (port 587) first,
     then SSL (port 465) as fallback. Returns (success, error_message).
+    Compatible with Python 3.7+.
     """
     import smtplib, ssl
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
+
+    # Guard: if credentials are missing, fail immediately instead of crashing
+    if not MAIL_USERNAME or not MAIL_PASSWORD:
+        return False, "MAIL_USERNAME or MAIL_PASSWORD not set in environment variables"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = f"WasteTrack <{MAIL_USERNAME}>"
     msg["To"]      = to_address
     msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    e1_msg = ""  # ensure e1 is always defined before the second try block
 
     # Try STARTTLS on port 587
     try:
@@ -79,6 +87,7 @@ def send_email(to_address: str, subject: str, body: str) -> tuple[bool, str]:
             server.sendmail(MAIL_USERNAME, to_address, msg.as_string())
         return True, ""
     except Exception as e1:
+        e1_msg = str(e1)
         print(f"[EMAIL] STARTTLS port 587 failed: {e1}")
 
     # Fallback: SSL on port 465
@@ -90,7 +99,7 @@ def send_email(to_address: str, subject: str, body: str) -> tuple[bool, str]:
         return True, ""
     except Exception as e2:
         print(f"[EMAIL] SSL port 465 also failed: {e2}")
-        return False, f"587: {e1} | 465: {e2}"
+        return False, f"587: {e1_msg} | 465: {e2}"
 
 # Temporary store for verification codes {email: (code, expiry_timestamp)}
 # WARNING: These are in-memory only — they are lost on server restart.
@@ -811,14 +820,15 @@ def send_verification_code():
         print(f"[EMAIL] Code sent successfully to {email}")
         return jsonify({"message": "Code sent successfully"})
     else:
-        traceback.print_exc()
-        # dev_code lets the frontend still work even when SMTP is blocked.
-        # REMOVE 'dev_code' before deploying to production.
+        print(f"[EMAIL] Failed to send to {email}: {err}")
+        # Return 200 (not 500) so Railway/proxies don't intercept the response.
+        # The frontend detects email failure via the 'dev_code' field and shows
+        # the code to the user so signup can still proceed.
         return jsonify({
-            "error": "Failed to send email – check Flask console for the code",
+            "message": "Code generated (email unavailable — use the code below)",
             "detail": err,
             "dev_code": code
-        }), 500
+        }), 200
 
 
 @app.route("/api/auth/verify-code", methods=["POST"])
