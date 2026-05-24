@@ -217,7 +217,7 @@ def register():
         return jsonify({"error": "Invalid email format"}), 400
     if email not in verified_emails:
         return jsonify({"error": "Email not verified. Please verify your email first"}), 403
-    verified_emails.discard(email)  # remove after use
+    verified_emails.discard(email)
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
@@ -228,22 +228,45 @@ def register():
     user_id         = str(uuid.uuid4())
     municipality    = None
     municipality_id = None
+    phone           = None
+    position        = None
     status          = "active"
 
     if role == "admin":
         municipality    = (data.get("municipality") or "").strip()
         municipality_id = (data.get("municipalityId") or "").strip()
+        phone           = (data.get("phone") or "").strip() or None
+        position        = (data.get("position") or "").strip() or None
+        name            = (data.get("adminName") or name).strip()
         if not municipality or not municipality_id:
             return jsonify({"error": "municipality and municipalityId required for admin"}), 400
-        name   = (data.get("adminName") or name).strip()
         status = "pending"
 
     execute(
         """INSERT INTO users
-           (id, name, email, password, role, municipality, municipality_id, status, provider, created_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (user_id, name, email, hashed, role, municipality, municipality_id, status, "email", now_dt())
+           (id, name, email, password, role, municipality, municipality_id, phone, position, status, provider, created_at)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (user_id, name, email, hashed, role, municipality, municipality_id, phone, position, status, "email", now_dt())
     )
+
+    # Create municipality record when admin registers
+    if role == "admin":
+        wilaya = (data.get("wilaya") or "").strip() or None
+        existing = query("SELECT id FROM municipalities WHERE id=%s", (municipality_id,), one=True)
+        if not existing:
+            execute(
+                """INSERT INTO municipalities
+                   (id, name, wilaya, admin_id, admin_name, admin_email, admin_phone, admin_position, status, registered_at)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (municipality_id, municipality, wilaya, user_id, name, email, phone, position, "pending", now_dt())
+            )
+        else:
+            # Update existing municipality with new admin info
+            execute(
+                """UPDATE municipalities SET admin_id=%s, admin_name=%s, admin_email=%s,
+                   admin_phone=%s, admin_position=%s, status='pending' WHERE id=%s""",
+                (user_id, name, email, phone, position, municipality_id)
+            )
 
     access  = create_access_token(identity=user_id)
     refresh = create_refresh_token(identity=user_id)
@@ -573,7 +596,10 @@ def list_complaints():
         sql    = "SELECT * FROM complaints WHERE 1=1"
         params = []
         if status_filter:
-            sql += " AND status=%s";     params.append(status_filter)
+            sql += " AND status=%s"; params.append(status_filter)
+        else:
+            # By default exclude resolved and closed — admins only see active reports
+            sql += " AND status NOT IN ('resolved','closed')"
         if type_filter:
             sql += " AND issue_type=%s"; params.append(type_filter)
         sql += " ORDER BY created_at DESC"
@@ -627,7 +653,7 @@ def update_complaint_status(complaint_id):
 @admin_required
 def list_users():
     rows = query(
-        "SELECT id,name,email,role,municipality,status,created_at,last_login FROM users ORDER BY created_at DESC"
+        "SELECT id,name,email,role,municipality,municipality_id,phone,position,status,created_at,last_login FROM users ORDER BY created_at DESC"
     )
     return jsonify(rows)
 
@@ -641,11 +667,43 @@ def update_user_status(user_id):
     if status not in VALID:
         return jsonify({"error": f"status must be one of {VALID}"}), 400
 
-    if not query("SELECT id FROM users WHERE id=%s", (user_id,), one=True):
+    user = query("SELECT id,role,municipality_id FROM users WHERE id=%s", (user_id,), one=True)
+    if not user:
         return jsonify({"error": "User not found"}), 404
 
     execute("UPDATE users SET status=%s WHERE id=%s", (status, user_id))
+
+    # Sync municipality status when approving/suspending an admin
+    if user["role"] == "admin" and user.get("municipality_id"):
+        muni_status = status  # active, pending, or suspended
+        if status == "active":
+            execute(
+                "UPDATE municipalities SET status='active', approved_at=%s WHERE id=%s",
+                (now_dt(), user["municipality_id"])
+            )
+        else:
+            execute(
+                "UPDATE municipalities SET status=%s WHERE id=%s",
+                (muni_status, user["municipality_id"])
+            )
+
     return jsonify({"message": f"User status updated to {status}"})
+
+
+@app.route("/api/admin/municipalities", methods=["GET"])
+@admin_required
+def list_municipalities():
+    rows = query("SELECT * FROM municipalities ORDER BY registered_at DESC")
+    return jsonify(rows or [])
+
+
+@app.route("/api/admin/municipalities/<muni_id>", methods=["GET"])
+@admin_required
+def get_municipality(muni_id):
+    row = query("SELECT * FROM municipalities WHERE id=%s", (muni_id,), one=True)
+    if not row:
+        return jsonify({"error": "Municipality not found"}), 404
+    return jsonify(row)
 
 
 # ─────────────────────────────────────────
@@ -798,12 +856,37 @@ def init_db():
                 role            ENUM('citizen','admin') NOT NULL DEFAULT 'citizen',
                 municipality    VARCHAR(120) DEFAULT NULL,
                 municipality_id VARCHAR(60)  DEFAULT NULL,
+                phone           VARCHAR(30)  DEFAULT NULL,
+                position        VARCHAR(120) DEFAULT NULL,
                 status          ENUM('active','pending','suspended') NOT NULL DEFAULT 'active',
                 provider        ENUM('email','google') NOT NULL DEFAULT 'email',
                 last_login      DATETIME     DEFAULT NULL,
                 created_at      DATETIME     NOT NULL,
                 PRIMARY KEY (id),
                 UNIQUE KEY email (email)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        # Add phone/position columns if upgrading from old schema
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN phone VARCHAR(30) DEFAULT NULL")
+        except: pass
+        try:
+            cur.execute("ALTER TABLE users ADD COLUMN position VARCHAR(120) DEFAULT NULL")
+        except: pass
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS municipalities (
+                id              VARCHAR(60)  NOT NULL,
+                name            VARCHAR(120) NOT NULL,
+                wilaya          VARCHAR(120) DEFAULT NULL,
+                admin_id        VARCHAR(36)  DEFAULT NULL,
+                admin_name      VARCHAR(120) DEFAULT NULL,
+                admin_email     VARCHAR(120) DEFAULT NULL,
+                admin_phone     VARCHAR(30)  DEFAULT NULL,
+                admin_position  VARCHAR(120) DEFAULT NULL,
+                status          ENUM('active','pending','suspended') NOT NULL DEFAULT 'pending',
+                registered_at   DATETIME     NOT NULL,
+                approved_at     DATETIME     DEFAULT NULL,
+                PRIMARY KEY (id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         cur.execute("""
