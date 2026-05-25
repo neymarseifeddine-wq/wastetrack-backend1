@@ -535,6 +535,8 @@ def submit_complaint():
     issue_type     = (form.get("issueType") or form.get("issue_type") or "").strip()
     severity       = (form.get("severity") or "").strip()
     location       = (form.get("location") or "").strip()
+    lat            = form.get("lat") or form.get("latitude") or None
+    lng            = form.get("lng") or form.get("longitude") or None
     description    = (form.get("description") or "").strip()
     reporter_name  = (form.get("reporterName") or form.get("reporter_name") or "").strip()
     reporter_email = (form.get("reporterEmail") or form.get("reporter_email") or "").strip().lower()
@@ -542,6 +544,12 @@ def submit_complaint():
     want_follow_up = form.get("followUp", False)
     if isinstance(want_follow_up, str):
         want_follow_up = want_follow_up.lower() in ("true", "1", "yes", "on")
+
+    # Convert lat/lng to float safely
+    try: lat = float(lat) if lat else None
+    except: lat = None
+    try: lng = float(lng) if lng else None
+    except: lng = None
 
     if not all([issue_type, severity, location, description, reporter_name, reporter_email]):
         return jsonify({"error": "issueType, severity, location, description, reporterName, reporterEmail required"}), 400
@@ -571,11 +579,11 @@ def submit_complaint():
 
     execute(
         """INSERT INTO complaints
-           (id, ref_number, issue_type, severity, location, description, photo_path,
+           (id, ref_number, issue_type, severity, location, lat, lng, description, photo_path,
             reporter_name, reporter_email, reporter_phone, want_follow_up,
             status, submitted_by, created_at, updated_at)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (complaint_id, ref_number, issue_type, severity, location, description, photo_path,
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (complaint_id, ref_number, issue_type, severity, location, lat, lng, description, photo_path,
          reporter_name, reporter_email, reporter_phone, int(want_follow_up),
          "open", submitted_by, created_at, created_at)
     )
@@ -868,7 +876,13 @@ def get_stats():
 # ─────────────────────────────────────────
 # Health check
 # ─────────────────────────────────────────
-@app.route("/api/health", methods=["GET"])
+@app.route("/uploads/<path:filename>", methods=["GET"])
+def serve_upload(filename):
+    from flask import send_from_directory
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+
 def health():
     return jsonify({"status": "ok", "service": "WasteTrack API", "version": "1.0.0"})
 
@@ -1054,6 +1068,8 @@ def init_db():
                 issue_type     VARCHAR(30)  NOT NULL,
                 severity       ENUM('low','medium','high') NOT NULL,
                 location       VARCHAR(255) NOT NULL,
+                lat            DECIMAL(10,7) DEFAULT NULL,
+                lng            DECIMAL(10,7) DEFAULT NULL,
                 description    TEXT         NOT NULL,
                 photo_path     VARCHAR(255) DEFAULT NULL,
                 reporter_name  VARCHAR(120) NOT NULL,
@@ -1068,6 +1084,13 @@ def init_db():
                 UNIQUE KEY ref_number (ref_number)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+        # Add lat/lng columns if upgrading from old schema
+        try:
+            cur.execute("ALTER TABLE complaints ADD COLUMN lat DECIMAL(10,7) DEFAULT NULL")
+        except: pass
+        try:
+            cur.execute("ALTER TABLE complaints ADD COLUMN lng DECIMAL(10,7) DEFAULT NULL")
+        except: pass
         conn.commit()
         conn.close()
         print("✅ Database tables ready")
