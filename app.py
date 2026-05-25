@@ -581,6 +581,45 @@ def submit_complaint():
     )
 
     row = query("SELECT * FROM complaints WHERE id=%s", (complaint_id,), one=True)
+
+    # 1. Send confirmation email to citizen
+    if want_follow_up and reporter_email:
+        citizen_body = (
+            f"Hello {reporter_name},\n\n"
+            f"Your complaint has been successfully submitted to WasteTrack.\n\n"
+            f"Reference Number : {ref_number}\n"
+            f"Issue Type       : {issue_type.replace('_', ' ').title()}\n"
+            f"Severity         : {severity.title()}\n"
+            f"Location         : {location}\n"
+            f"Description      : {description}\n\n"
+            f"Our team will review your report and take action as soon as possible.\n"
+            f"You can use your reference number to follow up on this complaint.\n\n"
+            f"Thank you for helping keep our community clean!\n\n"
+            f"– The WasteTrack Team"
+        )
+        send_email(reporter_email, f"WasteTrack – Complaint Received ({ref_number})", citizen_body)
+
+    # 2. Notify all active admins about the new complaint
+    admin_emails = query(
+        "SELECT email, name FROM users WHERE role='admin' AND status='active'", ()
+    )
+    if admin_emails:
+        admin_body = (
+            f"A new complaint has been submitted on WasteTrack.\n\n"
+            f"Reference Number : {ref_number}\n"
+            f"Issue Type       : {issue_type.replace('_', ' ').title()}\n"
+            f"Severity         : {severity.upper()}\n"
+            f"Location         : {location}\n"
+            f"Reporter         : {reporter_name} ({reporter_email})\n"
+            f"Description      : {description}\n\n"
+            f"Please log in to the admin dashboard to review and respond.\n\n"
+            f"– WasteTrack System"
+        )
+        for admin in admin_emails:
+            send_email(admin["email"],
+                       f"[WasteTrack] New {severity.upper()} Complaint – {ref_number}",
+                       admin_body)
+
     return jsonify(row), 201
 
 
@@ -667,7 +706,7 @@ def update_user_status(user_id):
     if status not in VALID:
         return jsonify({"error": f"status must be one of {VALID}"}), 400
 
-    user = query("SELECT id,role,municipality_id FROM users WHERE id=%s", (user_id,), one=True)
+    user = query("SELECT id,name,email,role,municipality_id,municipality FROM users WHERE id=%s", (user_id,), one=True)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
@@ -675,7 +714,6 @@ def update_user_status(user_id):
 
     # Sync municipality status when approving/suspending an admin
     if user["role"] == "admin" and user.get("municipality_id"):
-        muni_status = status  # active, pending, or suspended
         if status == "active":
             execute(
                 "UPDATE municipalities SET status='active', approved_at=%s WHERE id=%s",
@@ -684,7 +722,30 @@ def update_user_status(user_id):
         else:
             execute(
                 "UPDATE municipalities SET status=%s WHERE id=%s",
-                (muni_status, user["municipality_id"])
+                (status, user["municipality_id"])
+            )
+
+    # Send email notification to the user about their status change
+    if user.get("email"):
+        if status == "active" and user["role"] == "admin":
+            send_email(
+                user["email"],
+                "WasteTrack – Your Admin Account is Approved!",
+                f"Hello {user['name']},\n\n"
+                f"Great news! Your WasteTrack Municipality Admin account has been approved.\n\n"
+                f"Municipality : {user.get('municipality', '')}\n\n"
+                f"You can now log in and start managing waste containers and complaints for your municipality.\n\n"
+                f"Login at: https://curious-churros-1c58e7.netlify.app/wm.html\n\n"
+                f"– The WasteTrack Team"
+            )
+        elif status == "suspended":
+            send_email(
+                user["email"],
+                "WasteTrack – Account Suspended",
+                f"Hello {user['name']},\n\n"
+                f"Your WasteTrack account has been suspended.\n"
+                f"Please contact support for more information.\n\n"
+                f"– The WasteTrack Team"
             )
 
     return jsonify({"message": f"User status updated to {status}"})
@@ -707,8 +768,83 @@ def get_municipality(muni_id):
 
 
 # ─────────────────────────────────────────
-# STATS
+# Password Reset
 # ─────────────────────────────────────────
+_reset_codes = {}  # {email: (code, expiry)}
+
+@app.route("/api/auth/forgot-password", methods=["POST", "OPTIONS"])
+def forgot_password():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data  = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+
+    user = query("SELECT id, name FROM users WHERE email=%s", (email,), one=True)
+    if not user:
+        # Don't reveal if email exists
+        return jsonify({"message": "If this email is registered, a reset code has been sent"}), 200
+
+    code   = ''.join(random.choices(string.digits, k=6))
+    expiry = time.time() + 600  # 10 minutes
+    _reset_codes[email] = (code, expiry)
+    print(f"[WASTETRACK] Password reset code for {email}: {code}")
+
+    send_email(
+        email,
+        "WasteTrack – Password Reset Code",
+        f"Hello {user['name']},\n\n"
+        f"Your password reset code is:\n\n"
+        f"    {code}\n\n"
+        f"This code expires in 10 minutes.\n"
+        f"If you did not request this, ignore this email.\n\n"
+        f"– The WasteTrack Team"
+    )
+    return jsonify({"message": "If this email is registered, a reset code has been sent"}), 200
+
+
+@app.route("/api/auth/reset-password", methods=["POST", "OPTIONS"])
+def reset_password():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+    data     = request.get_json(force=True, silent=True) or {}
+    email    = (data.get("email") or "").strip().lower()
+    code     = (data.get("code") or "").strip()
+    password = data.get("new_password") or data.get("password", "")
+
+    if not email or not code or not password:
+        return jsonify({"error": "email, code and password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    entry = _reset_codes.get(email)
+    if not entry:
+        return jsonify({"error": "No reset code found. Please request a new one"}), 400
+    stored_code, expiry = entry
+    if time.time() > expiry:
+        del _reset_codes[email]
+        return jsonify({"error": "Reset code has expired. Please request a new one"}), 400
+    if code != stored_code:
+        return jsonify({"error": "Invalid reset code"}), 400
+
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    execute("UPDATE users SET password=%s WHERE email=%s", (hashed, email))
+    del _reset_codes[email]
+    return jsonify({"message": "Password reset successfully. You can now log in."}), 200
+
+
+
+@app.route("/api/complaints/history", methods=["GET"])
+@admin_required
+def complaints_history():
+    """Returns resolved and closed complaints for the history tab."""
+    rows = query(
+        "SELECT * FROM complaints WHERE status IN ('resolved','closed') ORDER BY updated_at DESC"
+    )
+    return jsonify(rows or [])
+
+
 @app.route("/api/stats", methods=["GET"])
 @admin_required
 def get_stats():
