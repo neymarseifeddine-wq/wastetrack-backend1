@@ -743,7 +743,7 @@ def update_user_status(user_id):
                 f"Great news! Your WasteTrack Municipality Admin account has been approved.\n\n"
                 f"Municipality : {user.get('municipality', '')}\n\n"
                 f"You can now log in and start managing waste containers and complaints for your municipality.\n\n"
-                f"Login at: https://curious-churros-1c58e7.netlify.app/wm.html\n\n"
+                f"Login at: https://shimmering-dragon-374c8f.netlify.app/wm.html\n\n"
                 f"– The WasteTrack Team"
             )
         elif status == "suspended":
